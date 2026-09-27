@@ -14,8 +14,12 @@ history crawl beyond feed pages 1–2.
 Install on the server:
 
 ```
-pip install "parentsquare-mcp @ git+https://github.com/s0meguy1/psquare-mcp@v0.4.0-ps.1"
+pip install "parentsquare-mcp @ git+https://github.com/s0meguy1/psquare-mcp@v0.4.0-ps.2"
 ```
+
+`v0.4.0-ps.2` is this build plus two fixes: the feed parser keeps an unreadable
+post's id instead of dropping it, and the fixture scrubber fakes Google
+document ids.
 
 ## Counts: browser vs parsed
 
