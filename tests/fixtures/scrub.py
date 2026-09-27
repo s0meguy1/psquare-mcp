@@ -9,7 +9,8 @@ weekday names, ...), short numbers (counts, times, dates) and data-timestamps.
 What does not: every other word is replaced by a pseudo-word of the same
 length and case (so "Community Members,<br>We" keeps its shape), every number
 of three or more digits is remapped consistently (ids stay linked across
-attributes and URLs), emails, URLs, signed-URL credentials, form tokens and
+attributes and URLs), emails, URLs (Google document ids included: they open
+the school's real documents), signed-URL credentials, form tokens and
 embedded JSON are rewritten, and scripts, comments and the page chrome are
 dropped. Mappings come from a keyed hash whose key is random per run and never
 stored, so they cannot be reversed.
@@ -119,6 +120,50 @@ def fake_hex(value: str) -> str:
     return h[: len(value)]
 
 
+def fake_token(value: str) -> str:
+    """A document id's stand-in: same length and character classes, from the keyed hash."""
+    h = _digest("t", value)
+    while len(h) < len(value):
+        h += _digest("t", h.hex())
+    out = []
+    for ch, b in zip(value, h):
+        if ch.isdigit():
+            out.append(str(b % 10))
+        elif ch.isupper():
+            out.append(chr(ord("A") + b % 26))
+        elif ch.islower():
+            out.append(chr(ord("a") + b % 26))
+        else:
+            out.append(ch)  # "-" and "_" keep their places
+    return "".join(out)
+
+
+_GOOGLE_ROUTE_WORDS = {
+    "forms", "d", "e", "u", "viewform", "formResponse", "spreadsheets", "document", "presentation",
+    "file", "files", "folders", "drive", "view", "edit", "preview", "copy", "pub", "pubhtml",
+    "htmlview", "embed", "open", "calendar", "event", "render", "r", "0", "1", "2", "3",
+}
+_GOOGLE_ID_RE = re.compile(r"[A-Za-z0-9_-]{10,}")
+
+
+def _scrub_google_path(path: str) -> str:
+    """A Google Docs, Drive, Forms or Calendar path: route words kept, document ids faked.
+
+    The ids are live links to a school's own documents (a sign-up sheet can be
+    editable by anyone who has the link), so none may survive into a fixture.
+    """
+    out = []
+    for seg in path.split("/"):
+        seg = unquote(seg)
+        if not seg or seg in _GOOGLE_ROUTE_WORDS:
+            out.append(seg)
+        elif _GOOGLE_ID_RE.fullmatch(seg):
+            out.append(fake_token(seg))
+        else:
+            out.append(quote(scrub_text(seg), safe=_SAFE))
+    return "/".join(out)
+
+
 def _scrub_words_path(path: str) -> str:
     """An external URL path: every segment scrubbed like text."""
     parts = []
@@ -207,7 +252,7 @@ def scrub_url(url: str) -> str:
     if ps_route or upload:
         new_host, path = parts.netloc, _scrub_route_path(parts.path, upload)
     elif google:
-        new_host, path = parts.netloc, parts.path
+        new_host, path = parts.netloc, _scrub_google_path(parts.path)
     else:
         labels = host.split(".")
         new_host = ".".join(pseudo_word(label) if i < len(labels) - 1 else label for i, label in enumerate(labels))
