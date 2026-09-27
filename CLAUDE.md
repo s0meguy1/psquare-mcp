@@ -5,14 +5,18 @@
 MCP server that scrapes ParentSquare's web UI. Runs as stdio transport. While there's no documented public API, ParentSquare has an internal JSON:API at `/api/v2/` that some tools use (e.g. directory).
 
 ```
-server.py          — MCP tool definitions, inline image/PDF fetching
-client.py          — HTTP client with auto-relogin on session expiry
-auth.py            — Cookie persistence (~/.parentsquare_cookies.json), credential loading (env vars → 1Password/LastPass), MFA flow
+server.py          — MCP tool definitions
+client.py          — HTTP client: timeouts, typed errors, auto-relogin, per-client cookie/MFA paths and credentials
+auth.py            — Cookie persistence (~/.parentsquare_cookies.json, atomic, mode 600), credential loading (env vars → 1Password/LastPass), MFA flow
+errors.py          — Typed exceptions (all RuntimeError) + raise_for_known_errors (429, 403 browser_unsupported)
+attachments.py     — Streaming, byte-capped downloads and PDF text, usable without the server
 audit.py           — Write-gate (PS_ENABLE_WRITES) + JSONL audit log for admin write tools
 config.py          — URL templates and constants (no personal data — auto-discovered at runtime)
 models.py          — Dataclasses for all parsed entities
 download.py        — File download with conflict handling
 parsers/           — One module per page type (feeds, calendar, media, messages, etc.); parsers/admin.py holds roster/edit-form parsing + write-body builders
+parsers/text.py    — element_text (browser innerText rules) and element_links, used by every parent-side parser
+parsers/dates.py   — data-timestamp parsing, year-from-weekday inference, Rails zone names
 export_cookies.py  — CLI helper to bootstrap cookies from browser DevTools
 ```
 
@@ -29,7 +33,9 @@ export_cookies.py  — CLI helper to bootstrap cookies from browser DevTools
 - The server supports MCP elicitation for inline MFA code entry
 - **User-Agent must include "Chrome"** — ParentSquare returns 403 `browser_unsupported` otherwise, and (worse) can serve *unauthenticated* content to a script-looking request that carries valid cookies, which ends in placeholder data rather than an error. `make_session()` in `client.py` owns this and is `PSClient`'s default session, so a bare `PSClient()` is browser-like too; `app_lifespan` just calls it. Do not re-apply the header at a call site.
 - The `ps_s` session cookie is **httpOnly** — it can't be read via `document.cookie`, which is why `export_cookies` requires the Network tab in DevTools
-- `ps_s` rotates on every request. `PSClient` calls `_save_cookies_if_changed()` after each successful request to persist the latest value.
+- `ps_s` rotates on every response (verified live: 25 writes for 25 requests). `PSClient._save_cookies_if_changed()` compares the jar with what it last saved and writes only on a change, through `auth.write_private` (temp file + `os.replace`, mode 600); saves log at DEBUG.
+- **Every request has a timeout** (`config.DEFAULT_TIMEOUT`, `PSClient(timeout=...)`, and `make_session()` returns a session with a default). Never add a bare `session.get`.
+- **Expiry detection:** a `/signin` bounce, a 200 HTML page rendering `gon.user_id=null`, or a JSON 401. One re-login, then `SessionExpired`. `PSClient(credentials=None)` never re-logs in. `auth.login`/`submit_mfa` take `cookie_path`/`mfa_state_path`; the client passes them only when non-default, so stubs of `auth.login(session, email, password)` keep working.
 - GraphQL requests (used by `list_groups`) require a CSRF token extracted from a page's `<meta name="csrf-token">` tag. MFA submit also requires a CSRF token from the MFA page.
 - **The CSRF token is cached on `PSClient` for the life of the session.** Rails derives it from a per-session secret, so it stays valid across requests even though `ps_s` rotates — verified live. Without the cache every single write paid an extra `GET /`. `_with_csrf()` wraps each write and retries **once** with a force-refreshed token if the response looks like a rejected token or a dead session (`_is_csrf_rejection`: a bounce to `/signin`, a 401/419, or a 403/422 whose body names the token). That detection is deliberately narrow — retrying a plain 422 validation error could re-apply a write that had actually landed. Because caching removed the implicit `GET /` (and its session-expiry check) from every write, this retry path is now the thing that recovers an expired session mid-write. `_relogin()` and MFA completion both call `invalidate_csrf_token()`.
 
@@ -45,6 +51,13 @@ ParentSquare has an internal JSON:API (not publicly documented). Discovered by i
 
 ### HTML Parsing
 - All parsing uses BeautifulSoup with `html.parser`
+- **Never use `get_text(strip=True)` for content** — it joins text nodes with nothing between them ("Members,We would"). Use `parsers.text.element_text` (innerText rules: `<br>`, blocks, `<p>` blank lines, table tabs, hidden content skipped) and `element_links` for hrefs.
+- **Parsers raise `ParseDriftError` rather than return `[]`** when a page evidently holds items (post ids, chat threads, messages, notice boxes) but none parse; partial loss logs a warning. A genuinely empty page still returns `[]`. Keep that contract in new parsers (`feeds.check_drift`).
+- **Feed-shaped pages** (feed, group feeds, sign-ups, forms, polls): find posts by `div#feed_<id>` at any depth (`feeds.iter_post_boxes`). The live nesting is `#feeds-list > ul.feeds-list > li.feeds-list-item > div.ps-box`; 0.4.0 assumed `ps-box` was a direct child and parsed nothing on the live site. `feed-metadata` is a `ul`, the feed icon is an initials avatar, and files are `ul.attachments a[href=/feeds/{id}/attachment/{aid}]` (302 to signed S3; the name is in `aria-label`). The editor wraps emoji in links to `fonts.gstatic.com/…/notoemoji/…` — not real links.
+- **Chats:** message elements are `div#chat-message-<digits>`; `div#chat-message-details` is the thread panel, so match the digits. `pull-right` = sent by this parent. Day headers have no year ("Thu, Sep 10") and times are in the school's zone (`/api/v2/schools/{id}` → `time_zone`, a Rails name). Images show a `thumb_` thumbnail; the full size is `a.thumbnail[data-url]`.
+- **Notices** are not in the feed (checked live). Ids come from `div#notice-<type>-<id>`; the full email is in `.show-on-click`, the SMS in `#smart-alert-text-message-<id>`. The page lists 3 weeks.
+- **The groups page is an empty React shell** (`#react-app-root`, `"ns":"groups"`), filled by GraphQL `GetGroups`/`GetGroupMemberships`/`GetGroupStats`. Use `PSClient.list_groups`, not HTML.
+- **Comments** render inline in `.comments-box`; the detail page also says "N comments on this post". Some schools make comments private, so zero is often right.
 - Two distinct image patterns exist in the DOM:
   - `img.feed-image-thumbnail` — gallery/attached images (outside description div)
   - `<img>` inside `.description` div — inline embedded images
@@ -198,8 +211,11 @@ and a test that pins it. Reserve the PR body for what cannot live in the tree:
 the limits of verification (e.g. "tested against fixtures, not a live district
 account"), provenance of a reverse-engineered endpoint, and reviewer asks.
 
+### Live fixtures (`tests/fixtures/live_2026_09`)
+Real server responses scrubbed by `tests/fixtures/scrub.py` (words → same-length pseudo-words, ids remapped consistently, URLs/tokens/JSON rewritten; the key is random per run). `expected_browser.json` is what **Chrome** reports (`innerText`, anchors) for the *scrubbed* files, loaded with the site's stylesheets — so regenerate every fixture *and* that file together. `ids.json` holds the fixtures' remapped ids. Before committing a new fixture, grep it for the real names, schools and ids you know are in the page: the repo is public.
+
 ### Adding a New Parser
-1. Create `parsers/<name>.py` with a `parse_*` function that takes `BeautifulSoup` and returns dataclass(es)
+1. Create `parsers/<name>.py` with a `parse_*` function that takes `BeautifulSoup` and returns dataclass(es); use `element_text`/`element_links` for text and `check_drift` for the empty-vs-unparseable distinction
 2. Add dataclass(es) to `models.py`
 3. Add the tool in `server.py` using the `@mcp.tool` decorator
 4. Wire through `_with_mfa_retry` for auth handling

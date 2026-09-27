@@ -41,7 +41,7 @@ Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io
 
 ### Participate
 - **`list_signups`** — Sign-up and RSVP posts with progress tracking (e.g. "53/103 Items")
-- **`list_notices`** — Alerts and secure documents
+- **`list_notices`** — Alerts and secure documents with their full text, SMS text, links and timestamps (alerts do not appear in the feed)
 - **`list_polls`** — Polls with vote counts and winning options
 - **`list_forms`** — Permission slips and signable forms
 - **`list_payments`** — Payment items with prices and summary stats
@@ -227,6 +227,54 @@ On first use, the server auto-discovers your schools, students, and user ID from
 For `get_post`, image attachments are downloaded and returned as MCP `Image` objects (so Claude can see them), and PDF attachments have their text extracted via pymupdf. `get_staff_member` also returns inline profile photos.
 
 Groups use a GraphQL endpoint (`/graphql`) instead of HTML scraping. The directory and staff details use the internal `/api/v2/` JSON:API.
+
+## Using it as a Python library
+
+The parsers and client also work without the MCP server, for example in a
+bot that watches several families' accounts from one process:
+
+```python
+from parentsquare_mcp.client import PSClient
+from parentsquare_mcp.errors import ParseDriftError, SessionExpired
+from parentsquare_mcp.parsers.feeds import parse_feed_page, parse_post_detail
+from parentsquare_mcp.parsers.messages import parse_chat_thread
+
+# One client per account; nothing is read from the environment.
+client = PSClient(
+    cookie_path=family_dir / "cookies.json",
+    mfa_state_path=family_dir / "mfa.json",
+    credentials=None,          # never log in again: raise SessionExpired instead
+    timeout=(10, 30),          # (connect, read) seconds, on every request
+)
+client.load_cookies()
+
+posts = parse_feed_page(client.get_page("/schools/123/feeds"), page="feed page 1")
+detail = parse_post_detail(client.get_page(f"/feeds/{posts[0].id}"))
+detail.body_text, detail.links, detail.posted_at, detail.attachments, detail.kinds, detail.event, detail.form
+
+tz = client.school_tz(123)     # chat and notice times are shown in the school's zone
+messages = parse_chat_thread(client.get_page(chat_path), tz=tz)
+messages[0].id, messages[0].is_mine, messages[0].posted_at
+```
+
+- **Nothing is silently dropped.** When a page clearly holds items (post ids, chat
+  threads, messages, notices) but none of them parse, the parser raises
+  `ParseDriftError` instead of returning `[]`; losing only some of them logs a
+  warning naming the page.
+- **Typed errors**, all `RuntimeError` subclasses: `SessionExpired`,
+  `LoginFailed`, `MFACodeInvalid`, `MFANotEstablished`, `BrowserUnsupported`,
+  `RateLimited` (with `retry_after`) and `ParseDriftError`, in
+  `parentsquare_mcp.errors`.
+- **Text keeps its line breaks and links survive**: bodies, summaries, comments,
+  messages and notices match the browser's `innerText`, and each carries its
+  `links`.
+- **Attachments**: `parentsquare_mcp.attachments.fetch()` streams with a byte cap
+  and a timeout; `fetch_pdf_text()` returns a PDF's text (needs the `pdf` extra).
+- Cookies are written only when they change, atomically, readable only by you
+  (mode 600).
+
+`docs/wishlist-report-2026-09.md` records what was checked against the live
+site and how.
 
 ## Dependencies
 
