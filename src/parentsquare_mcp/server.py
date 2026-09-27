@@ -19,10 +19,13 @@ from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.shared.exceptions import MCPError
 from pydantic import BaseModel, Field
 
-from parentsquare_mcp.auth import MFARequiredError, MFAState, load_cookies, submit_mfa
+from parentsquare_mcp.attachments import MAX_IMAGE_BYTES, MAX_PDF_BYTES
+from parentsquare_mcp.attachments import fetch_image as _download_image
+from parentsquare_mcp.attachments import fetch_pdf_text as _download_pdf_text
+from parentsquare_mcp.auth import MFARequiredError, MFAState, submit_mfa
 from parentsquare_mcp.audit import WRITES_DISABLED_MESSAGE, audit_write, writes_enabled
 from parentsquare_mcp.client import PSClient, make_session
-from parentsquare_mcp.config import DEFAULT_DOWNLOAD_DIR, URLS
+from parentsquare_mcp.config import DEFAULT_DOWNLOAD_DIR, DEFAULT_TIMEOUT, URLS
 from parentsquare_mcp.download import download_file as do_download
 from parentsquare_mcp.parsers.admin import (
     STUDENT_PROFILE_QUERY,
@@ -70,7 +73,7 @@ from parentsquare_mcp.parsers.enrollment import (
 )
 
 from parentsquare_mcp.parsers.feeds import parse_feed_page, parse_post_detail
-from parentsquare_mcp.models import ClassStaff, Group
+from parentsquare_mcp.models import ClassStaff
 from parentsquare_mcp.parsers.groups import parse_group_feed
 from parentsquare_mcp.parsers.links import parse_links_page
 from parentsquare_mcp.parsers.notices import parse_notices
@@ -81,7 +84,6 @@ from parentsquare_mcp.parsers.volunteer import parse_volunteer_hours
 from parentsquare_mcp.parsers.messages import parse_chat_thread, parse_conversation_list
 from parentsquare_mcp.parsers.schools import parse_sidebar_features
 from parentsquare_mcp.parsers.students import parse_student_dashboard
-from parentsquare_mcp.urls import redact_url
 
 # Configure logging to stderr only (stdout is reserved for MCP JSON-RPC)
 logging.basicConfig(
@@ -106,12 +108,12 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     if available, but 1Password and login only happen on the first actual request
     that needs authentication (via PSClient._relogin).
     """
-    session = make_session()
+    client = PSClient(session=make_session())
 
-    # Pre-load saved cookies if available (no network call, no 1Password)
-    load_cookies(session)
-
-    client = PSClient(session=session)
+    # Pre-load saved cookies if available (no network call, no 1Password). Going
+    # through the client records them as already saved, so an unchanged jar is
+    # never rewritten.
+    client.load_cookies()
     download_dir = Path(os.environ.get("PS_DOWNLOAD_DIR", DEFAULT_DOWNLOAD_DIR)).expanduser()
 
     # Restore pending MFA state from disk (survives server restarts)
@@ -132,6 +134,19 @@ issue them one at a time and verify with fresh reads.
 
 
 mcp = MCPServer("ParentSquare", lifespan=app_lifespan, instructions=MCP_INSTRUCTIONS)
+
+
+def _auth_kwargs(client: Any) -> dict:
+    """The cookie/MFA paths and timeout a client uses, when they differ from the defaults."""
+    kwargs: dict[str, Any] = {}
+    for name in ("cookie_path", "mfa_state_path"):
+        value = getattr(client, name, None)
+        if value is not None:
+            kwargs[name] = value
+    timeout = getattr(client, "timeout", DEFAULT_TIMEOUT)
+    if timeout != DEFAULT_TIMEOUT:
+        kwargs["timeout"] = timeout
+    return kwargs
 
 
 def _app(ctx: Context[Any, Any]) -> AppContext:
@@ -176,7 +191,7 @@ def submit_mfa_code(code: str, context: Context[Any, Any] = None) -> str:
         return "No pending MFA verification. Try calling a ParentSquare tool first to trigger login."
 
     try:
-        submit_mfa(app.client.session, app.mfa_state, code)
+        submit_mfa(app.client.session, app.mfa_state, code, **_auth_kwargs(app.client))
         app.mfa_state = None
         app.client.mfa_state = None
         app.client.invalidate_csrf_token()
@@ -209,7 +224,7 @@ async def _handle_mfa(app: AppContext, exc: MFARequiredError, ctx: Context[Any, 
         )
         if result.action == "accept":
             code = result.data.code.strip()
-            submit_mfa(app.client.session, exc.mfa_state, code)
+            submit_mfa(app.client.session, exc.mfa_state, code, **_auth_kwargs(app.client))
             app.mfa_state = None
             app.client.mfa_state = None
             app.client.invalidate_csrf_token()
@@ -302,6 +317,32 @@ async def list_school_features(school_id: int, context: Context[Any, Any]) -> st
 # ---------------------------------------------------------------------------
 
 
+def _indent(text: str, prefix: str = "  ") -> str:
+    return "\n".join(prefix + line if line else "" for line in text.splitlines())
+
+
+def _when(dt: Any, fallback: str = "") -> str:
+    return dt.isoformat() if dt is not None else fallback
+
+
+def _link_lines(links: list, limit: int | None = None, prefix: str = "- ") -> list[str]:
+    shown = links if limit is None else links[:limit]
+    lines = [f"{prefix}[{link.text}]({link.href})" for link in shown]
+    if limit is not None and len(links) > limit:
+        lines.append(f"{prefix}… {len(links) - limit} more")
+    return lines
+
+
+def _flags(p: Any) -> str:
+    flags = []
+    if getattr(p, "is_pinned", False):
+        flags.append("📌 pinned")
+    if getattr(p, "is_urgent", False):
+        flags.append("🚨 urgent")
+    flags.extend(k for k in getattr(p, "kinds", []) if k)
+    return f" [{', '.join(flags)}]" if flags else ""
+
+
 @mcp.tool(name="get_feeds")
 async def get_feeds(school_id: int, page: int = 1, context: Context[Any, Any] = None) -> str:
     """Get recent posts from a school's feed with titles, authors, dates, and summaries.
@@ -316,15 +357,18 @@ async def get_feeds(school_id: int, page: int = 1, context: Context[Any, Any] = 
     soup, err = await _with_mfa_retry(app, context, lambda: app.client.get_page(f"/schools/{school_id}/feeds", params={"page": str(page)}))
     if err:
         return err
-    posts = parse_feed_page(soup)
+    posts = parse_feed_page(soup, page=f"feed page {page}")
     if not posts:
         return "No posts found."
     lines = [f"# Feed for {_school_name(app, school_id)} (page {page})", ""]
     for p in posts:
-        lines.append(f"**{p.title}** (feed_id: {p.id})")
-        lines.append(f"  By {p.author} on {p.date}")
+        lines.append(f"**{p.title}** (feed_id: {p.id}){_flags(p)}")
+        lines.append(f"  By {p.author} on {_when(p.posted_at, p.date)}")
         if p.summary:
-            lines.append(f"  {p.summary}")
+            lines.append(_indent(p.summary))
+        if p.links:
+            lines.append("  Links:")
+            lines.extend(_link_lines(p.links, limit=8, prefix="  - "))
         extras = []
         if p.signup_progress:
             extras.append(f"📋 {p.signup_progress}")
@@ -341,51 +385,30 @@ async def get_feeds(school_id: int, page: int = 1, context: Context[Any, Any] = 
     return "\n".join(lines)
 
 
-_MAX_IMAGE_BYTES = 5 * 1024 * 1024  # skip images larger than 5 MB
+_MAX_IMAGE_BYTES = MAX_IMAGE_BYTES  # skip images larger than 5 MB
 _MAX_TOTAL_IMAGE_BYTES = 10 * 1024 * 1024  # stop fetching after 10 MB total
-_MAX_PDF_BYTES = 10 * 1024 * 1024  # skip PDFs larger than 10 MB
+_MAX_PDF_BYTES = MAX_PDF_BYTES  # skip PDFs larger than 10 MB
 
 
 def _fetch_image(client: PSClient, url: str) -> tuple[Image | None, int]:
     """Download an image and return (MCP Image, byte_count).
 
-    Returns (None, 0) if too large or failed.
+    Streams with a byte cap (see ``parentsquare_mcp.attachments``), so an
+    oversized image stops downloading at the cap. Returns (None, 0) if too
+    large or failed.
     """
-    try:
-        resp = client.get_raw(url)
-        size = len(resp.content)
-        if size > _MAX_IMAGE_BYTES:
-            return None, 0
-        content_type = resp.headers.get("content-type", "image/png")
-        fmt = content_type.split("/")[-1].split(";")[0].strip()
-        return Image(data=resp.content, format=fmt), size
-    except Exception:
-        logger.debug(f"Failed to fetch image: {redact_url(url)}", exc_info=True)
+    download = _download_image(client, url, max_bytes=_MAX_IMAGE_BYTES)
+    if download is None:
         return None, 0
+    return Image(data=download.data, format=download.subtype), download.size
 
 
 def _fetch_pdf_text(client: PSClient, url: str) -> str | None:
-    """Download a PDF and extract its text content.
+    """Download a PDF (streamed, capped) and extract its text content.
 
-    Returns extracted text, or None if failed/too large.
+    Returns extracted text, or None if failed/too large/pymupdf missing.
     """
-    try:
-        import fitz  # pymupdf
-
-        resp = client.get_raw(url)
-        if len(resp.content) > _MAX_PDF_BYTES:
-            return None
-        doc = fitz.open(stream=resp.content, filetype="pdf")
-        pages: list[str] = []
-        for page in doc:
-            text = page.get_text().strip()
-            if text:
-                pages.append(text)
-        doc.close()
-        return "\n\n---\n\n".join(pages) if pages else None
-    except Exception:
-        logger.debug(f"Failed to extract PDF text: {redact_url(url)}", exc_info=True)
-        return None
+    return _download_pdf_text(client, url, max_bytes=_MAX_PDF_BYTES)
 
 
 @mcp.tool(name="get_post")
@@ -405,10 +428,37 @@ async def get_post(feed_id: int, context: Context[Any, Any] = None) -> list:
     post = parse_post_detail(soup)
     lines = [
         f"# {post.title}",
-        f"By {post.author} on {post.date}",
+        f"By {post.author} on {_when(post.posted_at, post.date)}{_flags(post)}",
         "",
         post.body_text,
     ]
+    if post.links:
+        lines.extend(["", "## Links"])
+        lines.extend(_link_lines(post.links))
+    if post.event:
+        ev = post.event
+        lines.extend(["", "## Event"])
+        if ev.start:
+            lines.append(f"- Starts: {ev.start.isoformat()}" + (f", ends: {ev.end.isoformat()}" if ev.end else ""))
+        if ev.label:
+            lines.append(f"- As shown: {ev.label}")
+        if ev.location:
+            lines.append(f"- Location: {ev.location}")
+        if ev.rsvp:
+            lines.append(f"- Your RSVP: {ev.rsvp}")
+        if ev.ics_url:
+            lines.append(f"- Calendar file: {ev.ics_url}")
+    if post.form:
+        fm = post.form
+        signed = {True: "yes", False: "no", None: "unknown"}[fm.signed]
+        lines.extend(["", f"## Form: {fm.title or 'form'}"])
+        if fm.due:
+            lines.append(f"- {fm.due}")
+        if fm.note:
+            lines.append(f"- {fm.note}")
+        lines.append(f"- Signed/submitted by you: {signed}" + (" (closed)" if fm.closed else ""))
+        for q in fm.questions:
+            lines.append(f"- Q: {q}")
 
     # Collect image content blocks to return alongside text
     image_blocks: list[tuple[str, Image]] = []
@@ -478,12 +528,18 @@ async def get_post(feed_id: int, context: Context[Any, Any] = None) -> list:
                 names += f", +{len(s.signed_up) - 5} more"
             status = f" — {names}" if names else ""
             open_note = f" ({open_count} open)" if open_count > 0 else " ✅ full"
-            lines.append(f"- **{s.name}**{time_str}: {progress}{open_note}{status}")
+            day = f"{s.date} " if s.date else ""
+            mine = " ⭐ yours" if s.mine else ""
+            lines.append(f"- {day}**{s.name}**{time_str}: {progress}{open_note}{status}{mine}")
 
     if post.comments:
         lines.extend(["", f"## Comments ({len(post.comments)})"])
         for c in post.comments:
-            lines.append(f"- **{c.author}** ({c.date}): {c.text}")
+            lines.append(f"- **{c.author}** ({_when(c.posted_at, c.date)}): {c.text}")
+            for r in c.replies:
+                lines.append(f"  - ↳ **{r.author}** ({_when(r.posted_at, r.date)}): {r.text}")
+    elif post.comment_count == 0:
+        lines.extend(["", "_No comments visible to you on this post._"])
 
     # Return text + inline images + PDF text so Claude can see everything
     result: list = ["\n".join(lines)]
@@ -518,7 +574,7 @@ async def list_conversations(school_id: int, context: Context[Any, Any] = None) 
     soup, err = await _with_mfa_retry(app, context, _fetch_chats)
     if err:
         return err
-    convos = parse_conversation_list(soup)
+    convos = parse_conversation_list(soup, tz=app.client.school_tz(school_id))
     if not convos:
         return "No conversations found."
     lines = [f"# Conversations ({len(convos)})", ""]
@@ -526,9 +582,10 @@ async def list_conversations(school_id: int, context: Context[Any, Any] = None) 
     lines.append("")
     for c in convos:
         unread = " 🔴 UNREAD" if c.unread else ""
-        lines.append(f"**[chat_id={c.id}] {', '.join(c.participants)}**{unread}")
+        kind = "group" if c.is_group else "1:1"
+        lines.append(f"**[chat_id={c.id}] {', '.join(c.participants)}**{unread} ({kind}, {c.message_count} messages)")
         lines.append(f"  {c.last_message_preview}")
-        lines.append(f"  {c.date}")
+        lines.append(f"  {_when(c.last_message_at, c.date)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -551,13 +608,16 @@ async def get_conversation(school_id: int, chat_id: int, context: Context[Any, A
     soup, err = await _with_mfa_retry(app, context, _fetch_chat)
     if err:
         return err
-    messages = parse_chat_thread(soup)
+    messages = parse_chat_thread(soup, tz=app.client.school_tz(school_id), chat_id=chat_id)
     if not messages:
         return "No messages found in this conversation."
     lines = [f"# Conversation {chat_id}", ""]
     for m in messages:
-        lines.append(f"**{m.author}** ({m.date}):")
-        lines.append(f"  {m.text}")
+        direction = "you" if m.is_mine else "received"
+        lines.append(f"**{m.author}** ({_when(m.posted_at, m.date)}, {direction}, message_id={m.id}):")
+        if m.text:
+            lines.append(_indent(m.text))
+        lines.extend(_link_lines(m.links, prefix="  🔗 "))
         for a in m.attachments:
             lines.append(f"  📎 [{a.name}]({a.url})")
         lines.append("")
@@ -829,27 +889,6 @@ async def get_staff_member(school_id: int, user_id: int, context: Context[Any, A
 # ---------------------------------------------------------------------------
 
 
-_GROUPS_QUERY = """
-query GetGroups($institute: InstituteInputType!, $studentId: ID = null) {
-  groupsIndex(institute: $institute, studentId: $studentId) {
-    list {
-      instituteName
-      hasGroups
-      categorizedGroups {
-        name
-        groups {
-          id
-          name
-          description
-          isPublic
-        }
-      }
-    }
-  }
-}
-"""
-
-
 @mcp.tool(name="list_groups")
 async def list_groups(school_id: int, context: Context[Any, Any] = None) -> str:
     """List groups at a school with active post counts and descriptions.
@@ -862,46 +901,14 @@ async def list_groups(school_id: int, context: Context[Any, Any] = None) -> str:
     """
     app = _app(context)
 
-    def _fetch():
-        variables = {"institute": {"type": "school", "id": school_id}, "studentId": None}
-        return app.client.graphql(_GROUPS_QUERY, variables, "GetGroups")
-
-    data, err = await _with_mfa_retry(app, context, _fetch)
-    if err:
-        return err
-
-    cat_groups = (data.get("groupsIndex") or {}).get("list", {}).get("categorizedGroups", [])
-
     # ParentSquare removed userCount/activeFeedsCount/hasUserOrStudent (and
     # lastPostAt/feedsPath) from the GraphQL Group type, which made the old
-    # query 422 and broke list_groups entirely. Re-source the active-post count
-    # from the JSON:API groups endpoint (keyed by id); best-effort, falls back
-    # to 0. Member count is no longer exposed on either surface.
-    post_counts: dict[int, int] = {}
-    try:
-        jg = app.client.get_json(f"/api/v2/schools/{school_id}/groups")
-        for item in jg.get("data", []):
-            attrs = item.get("attributes", {})
-            gid = attrs.get("id") or item.get("id")
-            if gid is not None:
-                post_counts[int(gid)] = attrs.get("active_posts_count", 0)
-    except Exception:
-        logger.debug("Could not enrich group post counts from JSON:API", exc_info=True)
-
-    groups: list[Group] = []
-    for cat in cat_groups:
-        cat_name = cat.get("name", "")
-        for g in cat.get("groups", []):
-            gid = g["id"]
-            groups.append(Group(
-                id=gid,
-                name=g["name"],
-                member_count=0,  # userCount removed from GraphQL Group type
-                description=g.get("description"),
-                category=cat_name,
-                post_count=post_counts.get(int(gid), 0),
-                is_member=False,  # hasUserOrStudent removed from GraphQL Group type
-            ))
+    # query 422 and broke list_groups entirely. PSClient.list_groups re-sources
+    # the active-post count from the JSON:API groups endpoint (keyed by id);
+    # best-effort, falls back to 0. Member count is no longer exposed there.
+    groups, err = await _with_mfa_retry(app, context, lambda: app.client.list_groups(school_id))
+    if err:
+        return err
 
     if not groups:
         return "No groups found."
@@ -942,10 +949,12 @@ async def get_group_feed(school_id: int, group_id: int, context: Context[Any, An
         return "No posts in this group."
     lines = ["# Group Feed", ""]
     for p in posts:
-        lines.append(f"**[{p.id}] {p.title}**")
-        lines.append(f"  By {p.author} on {p.date}")
+        lines.append(f"**[{p.id}] {p.title}**{_flags(p)}")
+        lines.append(f"  By {p.author} on {_when(p.posted_at, p.date)}")
         if p.summary:
-            lines.append(f"  {p.summary}")
+            lines.append(_indent(p.summary))
+        if p.links:
+            lines.extend(_link_lines(p.links, limit=8, prefix="  - "))
         lines.append("")
     return "\n".join(lines)
 
@@ -971,12 +980,19 @@ async def get_student_dashboard(student_id: int, context: Context[Any, Any] = No
         "student": dashboard.student_name,
         "school": dashboard.school_name,
     }
+    if dashboard.school_id:
+        info["school_id"] = dashboard.school_id
     if dashboard.grade:
         info["grade"] = dashboard.grade
     if dashboard.teachers:
         info["teachers"] = dashboard.teachers
     if dashboard.classes:
         info["classes"] = dashboard.classes
+    if dashboard.sections:
+        info["sections"] = [
+            {"name": sec.name, "teachers": [{"name": t.name, "user_id": t.user_id} for t in sec.teachers]}
+            for sec in dashboard.sections
+        ]
     return info
 
 
@@ -1001,7 +1017,7 @@ async def list_signups(school_id: int, page: int = 1, context: Context[Any, Any]
     soup, err = await _with_mfa_retry(app, context, lambda: app.client.get_page(path, params={"page": str(page)}))
     if err:
         return err
-    posts = parse_feed_page(soup)
+    posts = parse_feed_page(soup, page="sign-ups page")
     if not posts:
         return f"No sign-ups or RSVP requests found for {_school_name(app, school_id)}."
     lines = [f"# Sign-Ups for {_school_name(app, school_id)} (page {page})", ""]
@@ -1029,16 +1045,24 @@ async def list_notices(school_id: int, context: Context[Any, Any] = None) -> str
     soup, err = await _with_mfa_retry(app, context, lambda: app.client.get_page(path))
     if err:
         return err
-    notices = parse_notices(soup)
+    notices = parse_notices(soup, school_id=school_id, tz=app.client.school_tz(school_id))
     if not notices:
         return f"No notices found for {_school_name(app, school_id)}."
     lines = [f"# Notices for {_school_name(app, school_id)} ({len(notices)})", ""]
+    lines.append("_Alerts listed here do not appear in the feed. The page keeps the past 3 weeks._")
+    lines.append("")
     for n in notices:
         icon = "🔔" if n.notice_type == "alert" else "📄"
-        lines.append(f"{icon} **{n.title}**")
-        lines.append(f"  {n.date}")
+        lines.append(f"{icon} **{n.title}** (notice_id: {n.id})")
+        lines.append(f"  {_when(n.posted_at, n.date)}")
         if n.school:
             lines.append(f"  From: {n.school}")
+        if n.body:
+            lines.append(_indent(n.body))
+        if n.text_message and " ".join(n.text_message.split()) != " ".join(n.body.split()):
+            lines.append("  Text message:")
+            lines.append(_indent(n.text_message, "    "))
+        lines.extend(_link_lines(n.links, prefix="  🔗 "))
         lines.append("")
     return "\n".join(lines)
 
@@ -1189,13 +1213,16 @@ async def list_forms(school_id: int, context: Context[Any, Any] = None) -> str:
     if err:
         return err
     # Forms page reuses the feeds-list structure
-    posts = parse_feed_page(soup)
+    posts = parse_feed_page(soup, page="forms page")
     if not posts:
         return f"No forms found for {_school_name(app, school_id)}."
     lines = [f"# Forms for {_school_name(app, school_id)} ({len(posts)})", ""]
     for p in posts:
-        lines.append(f"📝 **{p.title}** (feed_id: {p.id})")
-        lines.append(f"  By {p.author} on {p.date}")
+        signed = ""
+        if p.form is not None and p.form.signed is not None:
+            signed = " ✅ signed" if p.form.signed else " ✍️ not signed"
+        lines.append(f"📝 **{p.title}** (feed_id: {p.id}){signed}")
+        lines.append(f"  By {p.author} on {_when(p.posted_at, p.date)}")
         if p.summary:
             lines.append(f"  {p.summary}")
         lines.append("")
