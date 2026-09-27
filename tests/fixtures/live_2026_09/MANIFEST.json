@@ -1,0 +1,20 @@
+{
+ "feed_page": "school feed page 1, 10 posts, live layout",
+ "group_feed": "group feed, 4 posts",
+ "signups_page": "sign-ups page, 1 post",
+ "forms_empty": "forms page with no forms",
+ "polls_empty": "polls page with no polls",
+ "post_pdf": "PDF attachment, links, emoji-glyph anchors, inline images",
+ "post_event_form": "event (RSVP date) + signable form, deadline passed, links, alt text",
+ "post_signup": "appointment sign-up, 21 slots over 2 days",
+ "post_newsletter": "long newsletter: paragraphs, bullets, 11 links, images with alt",
+ "post_flyer": "image-only flyer (empty body)",
+ "post_class_newsletter": "class newsletter with bullets and links",
+ "chat_list": "conversation list, two 1:1 threads",
+ "chat_three_messages": "1:1 thread, 3 messages, one inbound link",
+ "chat_with_image": "1:1 thread, 2 messages, one image",
+ "notices": "two district alerts (email + text, text only)",
+ "student_dashboard": "student dashboard: h1 name, ul.sections-list",
+ "groups_shell": "groups page as served: empty React shell",
+ "logged_out": "what /schools/{id}/feeds returns without the session cookie (after the 302)"
+}

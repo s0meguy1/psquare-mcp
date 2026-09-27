@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import re
 
+import json
+
 from bs4 import BeautifulSoup
 
+from parentsquare_mcp.errors import ParseDriftError
 from parentsquare_mcp.models import FeedPost, Group
+from parentsquare_mcp.parsers.text import element_text, one_line
 
 
 def parse_groups_list(soup: BeautifulSoup) -> list[Group]:
@@ -18,6 +22,13 @@ def parse_groups_list(soup: BeautifulSoup) -> list[Group]:
       #react-app-root
         a[href*=/groups/][href*=/feeds]  (group name links)
         a[href*=/groups/][href*=/users]  (member count links, text="{N} Users")
+
+    Only a *rendered* page has those links. The HTML the server sends is an
+    empty React shell (``#react-app-root`` with ``"ns": "groups"`` in its
+    ``data-app-context``) that fills itself in over GraphQL, so parsing the
+    fetched page used to return ``[]`` every time. That now raises
+    ``ParseDriftError``; use ``PSClient.list_groups(school_id)``, which asks
+    the same GraphQL API the page does.
     """
     groups: list[Group] = []
 
@@ -35,7 +46,7 @@ def parse_groups_list(soup: BeautifulSoup) -> list[Group]:
             continue
         seen_ids.add(group_id)
 
-        name = link.get_text(strip=True)
+        name = one_line(element_text(link))
 
         # Find the containing element for this group
         # Walk up to find sibling/nearby elements with stats
@@ -66,6 +77,20 @@ def parse_groups_list(soup: BeautifulSoup) -> list[Group]:
             )
         )
 
+    if not groups:
+        root = soup.find(id="react-app-root")
+        context = {}
+        if root is not None:
+            try:
+                context = json.loads(root.get("data-app-context") or "{}")
+            except ValueError:
+                context = {}
+        if root is not None and context.get("ns") == "groups":
+            raise ParseDriftError(
+                "groups page",
+                "the server sends an empty React shell that loads groups over GraphQL; "
+                "use PSClient.list_groups(school_id) instead of parsing this page",
+            )
     return groups
 
 
@@ -77,4 +102,49 @@ def parse_group_feed(soup: BeautifulSoup) -> list[FeedPost]:
     """
     from parentsquare_mcp.parsers.feeds import parse_feed_page
 
-    return parse_feed_page(soup)
+    return parse_feed_page(soup, page="group feed")
+
+
+# The query the groups page itself sends (captured from the page, 2026-09).
+# userCount/activeFeedsCount/hasUserOrStudent were removed from the Group type,
+# so asking for them makes the whole query 422.
+GROUPS_QUERY = """
+query GetGroups($institute: InstituteInputType!, $studentId: ID = null) {
+  groupsIndex(institute: $institute, studentId: $studentId) {
+    list {
+      instituteName
+      hasGroups
+      categorizedGroups {
+        name
+        groups {
+          id
+          name
+          description
+          isPublic
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def groups_from_graphql(data: dict, post_counts: dict[int, int] | None = None) -> list[Group]:
+    """Map a ``GetGroups`` response (plus optional post counts by id) to Groups."""
+    post_counts = post_counts or {}
+    cat_groups = (data.get("groupsIndex") or {}).get("list", {}).get("categorizedGroups", [])
+    groups: list[Group] = []
+    for cat in cat_groups:
+        cat_name = cat.get("name", "")
+        for g in cat.get("groups", []):
+            gid = g["id"]
+            groups.append(Group(
+                id=int(gid),
+                name=g["name"],
+                member_count=0,  # userCount removed from GraphQL Group type
+                description=g.get("description"),
+                category=cat_name,
+                post_count=post_counts.get(int(gid), 0),
+                is_member=False,  # hasUserOrStudent removed from GraphQL Group type
+            ))
+    return groups

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass
@@ -19,6 +20,43 @@ class Student:
 
 
 @dataclass
+class Link:
+    """A link a reader can follow: its visible text and absolute href."""
+
+    text: str
+    href: str
+
+
+@dataclass
+class EventInfo:
+    """What a post's calendar dropdown says about its event (or RSVP date).
+
+    ``start``/``end`` are exact (UTC) when the post carries a Google Calendar
+    link, which encodes them; ``label`` is the site's own summary either way.
+    """
+
+    start: datetime | None = None
+    end: datetime | None = None
+    location: str | None = None
+    title: str = ""
+    label: str = ""               # "Sep 24, Thursday 6:30 PM To 8:00 PM"
+    ics_url: str | None = None    # /feeds/{id}/add_cal.ics
+    rsvp: str | None = None       # this parent's RSVP when the post shows one ("yes"/"no"/"maybe")
+
+
+@dataclass
+class FormInfo:
+    """A signable form or permission slip attached to a post."""
+
+    title: str = ""
+    due: str = ""                 # "Complete by Wednesday, Sep 23"
+    note: str = ""                # "Note: No action required. Form deadline has passed"
+    closed: bool = False          # the form's fields are disabled
+    signed: bool | None = None    # True/False when the page says so, None when it does not
+    questions: list[str] = field(default_factory=list)
+
+
+@dataclass
 class FeedPost:
     id: int
     title: str
@@ -30,6 +68,13 @@ class FeedPost:
     post_type: str = ""
     attachment_names: list[str] = field(default_factory=list)
     signup_progress: str = ""  # e.g. "53/103 Items • 6/14 Sign Ups"
+    posted_at: datetime | None = None   # from data-timestamp; ``date`` keeps the raw string
+    links: list[Link] = field(default_factory=list)
+    is_pinned: bool = False
+    kinds: list[str] = field(default_factory=list)  # every kind seen: event, signup, form, poll, ...
+    event: EventInfo | None = None
+    form: FormInfo | None = None
+    is_urgent: bool = False
 
 
 @dataclass
@@ -38,6 +83,7 @@ class Attachment:
     url: str
     file_type: str  # "image", "document", "video"
     thumbnail_url: str | None = None
+    alt: str | None = None  # the image's alt text / caption, when the poster gave one
 
 
 @dataclass
@@ -45,6 +91,10 @@ class Comment:
     author: str
     date: str
     text: str
+    posted_at: datetime | None = None
+    id: int | None = None
+    links: list[Link] = field(default_factory=list)
+    replies: list[Comment] = field(default_factory=list)
 
 
 @dataclass
@@ -54,6 +104,9 @@ class SignupItem:
     filled: int = 0
     total: int = 0
     signed_up: list[str] = field(default_factory=list)
+    date: str = ""         # the day heading the slot sits under, e.g. "Thursday, Oct 1"
+    status: str = ""       # "open", "closed" (full) or "mine"
+    mine: bool = False     # this parent holds the slot
 
 
 @dataclass
@@ -66,6 +119,14 @@ class PostDetail:
     comments: list[Comment] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
     signup_items: list[SignupItem] = field(default_factory=list)
+    posted_at: datetime | None = None
+    links: list[Link] = field(default_factory=list)
+    is_pinned: bool = False
+    kinds: list[str] = field(default_factory=list)
+    event: EventInfo | None = None
+    form: FormInfo | None = None
+    is_urgent: bool = False
+    comment_count: int | None = None  # the page's own "N comments on this post", when shown
 
 
 @dataclass
@@ -75,6 +136,9 @@ class Conversation:
     last_message_preview: str = ""
     date: str = ""
     unread: bool = False
+    is_group: bool = False
+    message_count: int = 0
+    last_message_at: datetime | None = None
 
 
 @dataclass
@@ -83,6 +147,11 @@ class Message:
     date: str
     text: str
     attachments: list[Attachment] = field(default_factory=list)
+    id: int | None = None
+    chat_id: int | None = None
+    is_mine: bool | None = None   # sent by this parent (True) or received (False)
+    posted_at: datetime | None = None
+    links: list[Link] = field(default_factory=list)
 
 
 @dataclass
@@ -130,6 +199,13 @@ class Notice:
     notice_type: str  # "alert" or "document"
     date: str
     school: str = ""
+    id: int | None = None          # stable, from the box's id="notice-<type>-<id>"
+    url: str = ""                  # the notices page, anchored at this notice
+    subject: str = ""
+    body: str = ""                 # the full email text (or the text message when that is all there is)
+    text_message: str = ""         # the SMS version, when sent
+    links: list[Link] = field(default_factory=list)
+    posted_at: datetime | None = None
 
 
 @dataclass
@@ -148,6 +224,7 @@ class Poll:
     options: list[PollOption] = field(default_factory=list)
     total_votes: int = 0
     user_voted: bool = False
+    posted_at: datetime | None = None
 
 
 @dataclass
@@ -189,12 +266,29 @@ class PaymentSummary:
 
 
 @dataclass
+class Teacher:
+    name: str
+    user_id: int | None = None
+
+
+@dataclass
+class StudentSection:
+    """One class on a student's dashboard and the staff listed on it."""
+
+    name: str
+    teachers: list[Teacher] = field(default_factory=list)
+
+
+@dataclass
 class StudentDashboard:
     student_name: str
     school_name: str
     grade: str | None = None
     teachers: list[str] = field(default_factory=list)
     classes: list[str] = field(default_factory=list)
+    student_id: int | None = None
+    school_id: int | None = None
+    sections: list[StudentSection] = field(default_factory=list)
 
 
 @dataclass
