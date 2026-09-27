@@ -106,9 +106,29 @@ def test_server_image_helper_uses_the_cap(monkeypatch):
 
 
 def test_pdf_text_extraction():
-    fitz = pytest.importorskip("fitz")
-    doc = fitz.open()
+    pymupdf = pytest.importorskip("pymupdf")
+    doc = pymupdf.open()
     doc.new_page().insert_text((72, 72), "Field trip on Friday")
     data = doc.tobytes()
     doc.close()
     assert "Field trip on Friday" in attachments.pdf_text(data)
+
+
+def test_pdf_text_never_touches_the_deprecated_fitz_alias():
+    # pymupdf prints its "fitz is deprecated" notice to stdout on import (not a
+    # Python warning), so check in a fresh interpreter that the alias is never
+    # imported and nothing is printed.
+    import subprocess
+    import sys
+
+    pytest.importorskip("pymupdf")
+    code = (
+        "import sys, pymupdf\n"
+        "from parentsquare_mcp.attachments import pdf_text\n"
+        "doc = pymupdf.open(); doc.new_page().insert_text((72, 72), 'x'); data = doc.tobytes()\n"
+        "pdf_text(data)\n"
+        "print('fitz imported' if 'fitz' in sys.modules else 'clean')\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "clean"
+    assert "deprecated" not in out.stdout + out.stderr

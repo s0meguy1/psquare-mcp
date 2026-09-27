@@ -104,11 +104,13 @@ def fetch(source: Any, url: str, *, max_bytes: int, timeout: Any = None,
 def pdf_text(data: bytes) -> str | None:
     """Text of a PDF, pages separated by ``---``; None without pymupdf or text."""
     try:
-        import fitz  # pymupdf, the optional "pdf" extra
+        # The optional "pdf" extra. Imported by its own name: the old ``fitz``
+        # alias warns that it is deprecated and will be removed.
+        import pymupdf
     except ImportError:
         logger.debug("pymupdf is not installed; install parentsquare-mcp[pdf] for PDF text")
         return None
-    doc = fitz.open(stream=data, filetype="pdf")
+    doc = pymupdf.open(stream=data, filetype="pdf")
     try:
         pages = [text for page in doc if (text := page.get_text().strip())]
     finally:
