@@ -1,6 +1,6 @@
 [project]
 name = "parentsquare-mcp"
-version = "0.4.0+ps.2"
+version = "0.4.0+ps.3"
 description = "MCP server that gives Claude AI access to ParentSquare — feeds, calendar events, messages, directories, plus admin roster management for students and guardians"
 readme = "README.md"
 license = "MIT"

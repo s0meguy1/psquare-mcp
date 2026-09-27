@@ -404,7 +404,7 @@ wheels = [
 
 [[package]]
 name = "parentsquare-mcp"
-version = "0.4.0+ps.2"
+version = "0.4.0+ps.3"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
