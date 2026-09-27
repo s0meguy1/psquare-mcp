@@ -125,9 +125,12 @@ def test_groups_page_shell_raises_with_guidance():
         parse_groups_list(BeautifulSoup(load("groups_shell"), "html.parser"))
 
 
-def test_partial_loss_is_logged_not_raised(caplog):
+def test_an_unreadable_post_is_logged_and_kept_by_id(caplog):
+    # Callers diff post ids to decide what to fetch in full, so a post the
+    # summary parser cannot read must still come back, never be dropped.
     soup = BeautifulSoup(load("feed_page"), "html.parser")
     victim = soup.find("div", id=re.compile(r"^feed_\d+$"))
+    victim_id = int(victim["id"].split("_")[1])
     for el in victim.find_all(True):
         el.attrs.pop("class", None)
         el.attrs.pop("role", None)
@@ -136,5 +139,8 @@ def test_partial_loss_is_logged_not_raised(caplog):
     victim.parent.attrs.pop("aria-label", None)
     with caplog.at_level("WARNING"):
         posts = parse_feed_page(soup, page="feed page 1")
-    assert len(posts) == 9
-    assert "parsed 9 of 10 posts" in caplog.text and "feed page 1" in caplog.text
+    assert len(posts) == 10
+    bare = next(p for p in posts if p.id == victim_id)
+    assert (bare.author, bare.date, bare.summary) == ("", "", "")
+    assert "could not read 1 of 10 posts" in caplog.text and str(victim_id) in caplog.text
+    assert "feed page 1" in caplog.text

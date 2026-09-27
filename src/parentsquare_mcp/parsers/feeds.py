@@ -714,9 +714,30 @@ def parse_feed_page(soup: BeautifulSoup, page: str = "feed page") -> list[FeedPo
     Raises ``ParseDriftError`` when the page holds posts (``div#feed_<id>``)
     but none of them parse, so a markup change cannot pass for an empty feed.
     *page* names the page in that error.
+
+    A post whose own markup is not understood, on a page where others are, is
+    still returned, with its id and whatever title it has, and logged: callers
+    that diff post ids (to fetch each new post in full) must never lose one.
     """
-    posts = [post for feed_id, box in iter_post_boxes(soup) if (post := _parse_feed_box(feed_id, box))]
-    check_drift(page, count_feed_markers(soup), len(posts), "posts")
+    posts: list[FeedPost] = []
+    unread: list[int] = []
+    for feed_id, box in iter_post_boxes(soup):
+        post = _parse_feed_box(feed_id, box)
+        if post is None:
+            unread.append(feed_id)
+            post = FeedPost(id=feed_id, title=_title(box), author="", date="", summary="")
+        posts.append(post)
+    markers = count_feed_markers(soup)
+    readable = len(posts) - len(unread)
+    if markers and not readable:
+        check_drift(page, markers, 0, "posts")  # raises ParseDriftError
+    if unread:
+        logger.warning(
+            "%s: could not read %d of %d posts (%s); they are returned with their id and title only",
+            page, len(unread), len(posts), ", ".join(map(str, unread)),
+        )
+    if len(posts) < markers:
+        logger.warning("%s: %d post(s) sit outside the feed list and were not parsed", page, markers - len(posts))
     if posts and not any(p.date for p in posts):
         logger.warning("%s: no post has a timestamp; the date markup may have changed", page)
     return posts
