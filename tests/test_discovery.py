@@ -251,3 +251,68 @@ class TestExtractGon:
         soup = BeautifulSoup("<script>var x = 1;</script>", "html.parser")
 
         assert client._extract_gon(soup) == (0, 0, "")
+
+
+# --- W17: students are matched to schools by id, not by a name substring ----------
+
+def _two_school_client(school_names, student_detail, dashboard_gon=None):
+    """A district with two member schools and one student whose sidebar says *student_detail*."""
+    fragment = "".join(f'<a href="/schools/{sid}/feeds">{name}</a>' for sid, name in school_names.items())
+    feeds = f"""
+    <a href="/students/601/dashboard"><h4>Grace Hopper</h4>
+      <div class="truncate-text">{student_detail}</div></a>"""
+    pages = {"/layout_templates/district_switch_schools_list": fragment}
+    if dashboard_gon is not None:
+        pages["/students/601/dashboard"] = f"<script>gon.user_id=42;{dashboard_gon}</script>"
+    pages.update({f"/schools/{sid}/feeds": feeds for sid in school_names})
+    pages["/"] = _root()
+    return FakeClient(
+        pages=pages,
+        json_pages={f"/api/v2/schools/{sid}": _school_json(name) for sid, name in school_names.items()},
+        missing_json=[f"/api/v2/schools/{DISTRICT_ID}"],
+    )
+
+
+def test_ambiguous_school_name_is_resolved_from_the_dashboard():
+    client = _two_school_client({SCHOOL_A: "Lincoln Elementary", SCHOOL_B: "Lincoln Middle"}, "3rd Grade • Lincoln",
+                                dashboard_gon=f'gon.institute_id={SCHOOL_B};gon.institute_type="School";')
+    account = client.discover_account()
+    assert account.students[601]["school_id"] == SCHOOL_B
+    assert "/students/601/dashboard" in client.requested
+
+
+def test_exact_school_name_beats_a_substring():
+    client = _two_school_client({SCHOOL_A: "Alpha Elementary", SCHOOL_B: "Alpha Elementary Annex"},
+                                "2nd Grade • Alpha Elementary")
+    account = client.discover_account()
+    assert account.students[601]["school_id"] == SCHOOL_A
+    assert "/students/601/dashboard" not in client.requested  # no extra request needed
+
+
+def test_unmatched_student_is_reported_not_silently_zero(caplog):
+    client = _two_school_client({SCHOOL_A: "Alpha Elementary", SCHOOL_B: "Beta Middle"}, "2nd Grade • Gamma Academy")
+    with caplog.at_level("WARNING"):
+        account = client.discover_account()
+    assert account.students[601]["school_id"] == 0
+    assert "Could not match student 601" in caplog.text
+
+
+def test_single_school_account_needs_no_name_match():
+    client = FakeClient(
+        pages={f"/schools/{SCHOOL_A}/feeds": """<a href="/students/601/dashboard"><h4>Grace Hopper</h4>
+               <div class="truncate-text">K • Alpha Elem.</div></a>""",
+               "/students/601/dashboard": "<p>no gon here</p>",
+               "/": _root(institute_id=SCHOOL_A, institute_type="School")},
+        json_pages={f"/api/v2/schools/{SCHOOL_A}": _school_json("Alpha Elementary School")},
+    )
+    assert client.discover_account().students[601]["school_id"] == SCHOOL_A
+
+
+def test_school_time_zone_is_kept():
+    client = FakeClient(
+        pages={f"/schools/{SCHOOL_A}/feeds": "<div></div>", "/": _root(institute_id=SCHOOL_A, institute_type="School")},
+        json_pages={f"/api/v2/schools/{SCHOOL_A}": {"data": {"attributes": {
+            "name": "Alpha", "time_zone": "Eastern Time (US & Canada)"}}}},
+    )
+    client.discover_account()
+    assert str(client.school_tz(SCHOOL_A)) == "America/New_York"

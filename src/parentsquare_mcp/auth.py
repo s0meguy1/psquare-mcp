@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -12,12 +14,41 @@ from urllib.parse import parse_qs, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from parentsquare_mcp.config import BASE_URL
+from parentsquare_mcp.config import BASE_URL, DEFAULT_TIMEOUT
+from parentsquare_mcp.errors import LoginFailed, MFACodeInvalid, MFANotEstablished, raise_for_known_errors
 
 logger = logging.getLogger(__name__)
 
+# Defaults for the MCP server, read from the environment once. Every function
+# below takes an explicit path and falls back to these module globals *at call
+# time*, so a caller can also reassign ``auth.COOKIE_FILE`` (as pstriage does)
+# or, better, pass ``PSClient(cookie_path=..., mfa_state_path=...)``.
 COOKIE_FILE = Path(os.environ.get("PS_COOKIE_FILE", "~/.parentsquare_cookies.json")).expanduser()
 MFA_STATE_FILE = COOKIE_FILE.with_name(".parentsquare_mfa_state.json")
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically, readable only by the owner (mode 600).
+
+    The data goes to a temporary file in the same directory (created 600 by
+    ``mkstemp``), is flushed to disk, then ``os.replace``d over *path*. A process
+    killed mid-write therefore leaves the old file intact instead of broken
+    JSON, and there is no window in which a cookie file has default permissions.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
 
 
 @dataclass
@@ -29,24 +60,25 @@ class MFAState:
     email: str  # the actual email used to login
     csrf_token: str = ""  # CSRF token from the MFA page — required for /mfa/submit
 
-    def save(self) -> None:
-        """Persist MFA state to disk so it survives server restarts."""
-        MFA_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        MFA_STATE_FILE.write_text(json.dumps({
+    def save(self, path: Path | None = None) -> None:
+        """Persist MFA state (atomically, mode 600) so it survives server restarts."""
+        path = Path(path or MFA_STATE_FILE)
+        write_private(path, json.dumps({
             "contact_value": self.contact_value,
             "contact_method": self.contact_method,
             "email": self.email,
             "csrf_token": self.csrf_token,
         }))
-        logger.info(f"Saved MFA state to {MFA_STATE_FILE}")
+        logger.info(f"Saved MFA state to {path}")
 
     @classmethod
-    def load(cls) -> MFAState | None:
+    def load(cls, path: Path | None = None) -> MFAState | None:
         """Load persisted MFA state from disk. Returns None if not found."""
-        if not MFA_STATE_FILE.exists():
+        path = Path(path or MFA_STATE_FILE)
+        if not path.exists():
             return None
         try:
-            data = json.loads(MFA_STATE_FILE.read_text())
+            data = json.loads(path.read_text())
             return cls(
                 contact_value=data["contact_value"],
                 contact_method=data["contact_method"],
@@ -58,10 +90,11 @@ class MFAState:
             return None
 
     @staticmethod
-    def clear() -> None:
+    def clear(path: Path | None = None) -> None:
         """Remove persisted MFA state file."""
-        if MFA_STATE_FILE.exists():
-            MFA_STATE_FILE.unlink()
+        path = Path(path or MFA_STATE_FILE)
+        if path.exists():
+            path.unlink()
             logger.info("Cleared MFA state file")
 
 
@@ -202,8 +235,12 @@ def load_credentials() -> tuple[str, str]:
     )
 
 
-def save_cookies(session: requests.Session) -> None:
-    """Persist session cookies to disk for reuse across server restarts."""
+def save_cookies(session: requests.Session, path: Path | None = None) -> None:
+    """Persist session cookies (atomically, mode 600) for reuse across restarts.
+
+    *path* defaults to ``COOKIE_FILE`` as it is when called.
+    """
+    path = Path(path or COOKIE_FILE)
     cookies = {}
     for cookie in session.cookies:
         cookies[cookie.name] = {
@@ -212,16 +249,20 @@ def save_cookies(session: requests.Session) -> None:
             "path": cookie.path,
             "secure": cookie.secure,
         }
-    COOKIE_FILE.write_text(json.dumps(cookies, indent=2))
-    logger.info(f"Saved {len(cookies)} cookies to {COOKIE_FILE}")
+    write_private(path, json.dumps(cookies, indent=2))
+    logger.debug(f"Saved {len(cookies)} cookies to {path}")
 
 
-def load_cookies(session: requests.Session) -> bool:
-    """Load previously saved cookies. Returns True if cookies were loaded."""
-    if not COOKIE_FILE.exists():
+def load_cookies(session: requests.Session, path: Path | None = None) -> bool:
+    """Load previously saved cookies. Returns True if cookies were loaded.
+
+    *path* defaults to ``COOKIE_FILE`` as it is when called.
+    """
+    path = Path(path or COOKIE_FILE)
+    if not path.exists():
         return False
     try:
-        cookies = json.loads(COOKIE_FILE.read_text())
+        cookies = json.loads(path.read_text())
         for name, data in cookies.items():
             session.cookies.set(
                 name,
@@ -229,16 +270,17 @@ def load_cookies(session: requests.Session) -> bool:
                 domain=data.get("domain", ".parentsquare.com"),
                 path=data.get("path", "/"),
             )
-        logger.info(f"Loaded {len(cookies)} cookies from {COOKIE_FILE}")
+        logger.debug(f"Loaded {len(cookies)} cookies from {path}")
         return True
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning(f"Failed to load cookies: {e}")
+    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+        logger.warning(f"Failed to load cookies from {path}: {e}")
         return False
 
 
-def extract_csrf_token(session: requests.Session) -> str:
+def extract_csrf_token(session: requests.Session, timeout=DEFAULT_TIMEOUT) -> str:
     """GET /signin and extract CSRF token from <meta name='csrf-token'> tag."""
-    resp = session.get(f"{BASE_URL}/signin")
+    resp = session.get(f"{BASE_URL}/signin", timeout=timeout)
+    raise_for_known_errors(resp)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     meta = soup.find("meta", attrs={"name": "csrf-token"})
@@ -247,14 +289,17 @@ def extract_csrf_token(session: requests.Session) -> str:
     return meta["content"]
 
 
-def login(session: requests.Session, email: str, password: str) -> None:
+def login(session: requests.Session, email: str, password: str, *, cookie_path: Path | None = None,
+          mfa_state_path: Path | None = None, timeout=DEFAULT_TIMEOUT) -> None:
     """Perform full login flow: extract CSRF, POST credentials, verify success.
 
     If 2FA is required, raises MFARequiredError with state needed to complete
-    verification via submit_mfa_code().
+    verification via submit_mfa_code(). Raises ``LoginFailed`` when the
+    credentials are rejected. Cookies and MFA state are written to
+    *cookie_path* / *mfa_state_path* (default: the module's paths).
     """
     logger.info("Logging in to ParentSquare...")
-    csrf = extract_csrf_token(session)
+    csrf = extract_csrf_token(session, timeout=timeout)
     resp = session.post(
         f"{BASE_URL}/sessions",
         data={
@@ -269,7 +314,9 @@ def login(session: requests.Session, email: str, password: str) -> None:
             "Referer": f"{BASE_URL}/signin",
         },
         allow_redirects=True,
+        timeout=timeout,
     )
+    raise_for_known_errors(resp)
 
     # After successful login, should redirect away from /signin
     if "mfa_required" in resp.url:
@@ -290,7 +337,7 @@ def login(session: requests.Session, email: str, password: str) -> None:
             logger.warning("No CSRF token found on MFA page")
 
         # Save cookies from login attempt — needed for /mfa/submit
-        save_cookies(session)
+        save_cookies(session, cookie_path)
 
         mfa_state = MFAState(
             contact_value=contact_value,
@@ -299,23 +346,28 @@ def login(session: requests.Session, email: str, password: str) -> None:
             csrf_token=csrf_token,
         )
         # Persist MFA state so it survives server restarts
-        mfa_state.save()
+        mfa_state.save(mfa_state_path)
         raise MFARequiredError(mfa_state)
 
     if "/signin" in resp.url:
-        raise RuntimeError("Login failed — redirected back to signin. Check credentials.")
+        raise LoginFailed("Login failed — redirected back to signin. Check credentials.")
 
     logger.info("Successfully logged in to ParentSquare")
-    save_cookies(session)
+    save_cookies(session, cookie_path)
 
 
-def submit_mfa(session: requests.Session, mfa_state: MFAState, code: str) -> None:
+def submit_mfa(session: requests.Session, mfa_state: MFAState, code: str, *, cookie_path: Path | None = None,
+               mfa_state_path: Path | None = None, timeout=DEFAULT_TIMEOUT) -> None:
     """Submit a 6-digit MFA verification code to complete login.
 
     Args:
         session: The requests session (must already have cookies from login attempt)
         mfa_state: MFA state from the login redirect
         code: The 6-digit verification code from email/phone
+
+    Raises ``MFACodeInvalid`` for a wrong or expired code and
+    ``MFANotEstablished`` when the code is accepted but the session is still
+    not authenticated.
     """
     logger.info("Submitting MFA verification code...")
     payload: dict[str, str] = {
@@ -340,10 +392,12 @@ def submit_mfa(session: requests.Session, mfa_state: MFAState, code: str) -> Non
         f"{BASE_URL}/mfa/submit",
         json=payload,
         headers=headers,
+        timeout=timeout,
     )
+    raise_for_known_errors(resp)
 
     if resp.status_code == 401:
-        raise RuntimeError(
+        raise MFACodeInvalid(
             "MFA verification failed — invalid or expired code. "
             "Check your email for the latest code and try submit_mfa_code again."
         )
@@ -355,21 +409,21 @@ def submit_mfa(session: requests.Session, mfa_state: MFAState, code: str) -> Non
         # Follow the redirect to establish the full session
         if redirect_url.startswith("/"):
             redirect_url = f"{BASE_URL}{redirect_url}"
-        session.get(redirect_url)
+        session.get(redirect_url, timeout=timeout)
 
     # Verify the MFA actually established an authenticated session
-    if not is_session_valid(session):
-        raise RuntimeError(
+    if not is_session_valid(session, timeout=timeout):
+        raise MFANotEstablished(
             "MFA code was accepted but session is not authenticated. "
             "The code may have expired. Try logging in again to get a new code."
         )
 
     logger.info("MFA verification successful")
-    save_cookies(session)
-    MFAState.clear()
+    save_cookies(session, cookie_path)
+    MFAState.clear(mfa_state_path)
 
 
-def is_session_valid(session: requests.Session) -> bool:
+def is_session_valid(session: requests.Session, timeout=DEFAULT_TIMEOUT) -> bool:
     """Check whether the session is authenticated.
 
     ParentSquare returns 200 on the root page even without auth, so we can't
@@ -385,7 +439,7 @@ def is_session_valid(session: requests.Session) -> bool:
     title would misclassify a working session and force endless re-logins.
     Pinned by tests/test_user_agent.py::test_signin_title_with_user_id_is_valid.
     """
-    resp = session.get(f"{BASE_URL}/", allow_redirects=True)
+    resp = session.get(f"{BASE_URL}/", allow_redirects=True, timeout=timeout)
     if "/signin" in resp.url:
         return False
     if resp.status_code != 200:

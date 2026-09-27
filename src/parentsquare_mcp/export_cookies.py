@@ -15,7 +15,7 @@ import json
 import sys
 import webbrowser
 
-from parentsquare_mcp.auth import COOKIE_FILE
+from parentsquare_mcp.auth import COOKIE_FILE, write_private
 from parentsquare_mcp.config import BASE_URL
 
 # Keep every byte printed by this script inside ASCII.
@@ -115,8 +115,7 @@ def export_from_devtools() -> None:
         for line in WARN_NO_SESSION_COOKIE:
             print(line)
 
-    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    COOKIE_FILE.write_text(json.dumps(cookies, indent=2))
+    write_private(COOKIE_FILE, json.dumps(cookies, indent=2))
     print(f"\nSaved {len(cookies)} cookies to {COOKIE_FILE}")
     print("   You can now start the MCP server.")
 

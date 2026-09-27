@@ -2,6 +2,10 @@ from __future__ import annotations
 
 BASE_URL = "https://www.parentsquare.com"
 
+# (connect, read) seconds for every HTTP call. Without one a stalled read waits
+# forever; see PSClient(timeout=...) and make_session(timeout=...).
+DEFAULT_TIMEOUT: tuple[float, float] = (10, 30)
+
 URLS = {
     "signin": "/signin",
     "feeds": "/schools/{school_id}/feeds",
